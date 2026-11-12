@@ -204,7 +204,13 @@ jobs:
             *) echo "unknown variant $VARIANT"; exit 1 ;;
           esac
           chmod +x ./gradlew
-          ./gradlew "assemble${FLAVOR}Release" -PAPP_ID="$PKG" -PVERSION_NAME="$TAG"
+          # 预览版的 versionNameSuffix 已经是 git hash 了，再传上游 tag 会拼成
+          # "26.11.1f3f2a5.1f3f2a5"；稳定版没有后缀，才需要显式指定
+          if [ "$FLAVOR" = "Stable" ]; then
+            ./gradlew "assemble${FLAVOR}Release" -PAPP_ID="$PKG" -PVERSION_NAME="$TAG"
+          else
+            ./gradlew "assemble${FLAVOR}Release" -PAPP_ID="$PKG"
+          fi
           APK=$(find app/build/outputs/apk -path '*/release/*.apk' -type f | head -n 1)
           [ -n "$APK" ] || { ls -R app/build/outputs/apk; exit 1; }
           echo "path=$PWD/$APK" >> "$GITHUB_OUTPUT"
