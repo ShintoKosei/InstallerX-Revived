@@ -1,13 +1,13 @@
 name: Build system module
 
 # 触发方式
-#  1) schedule：每 6 小时做一次「上游有没有新版本」的轻量检查（几秒钟），
+#  1) schedule：每 15 分钟做一次「上游有没有新版本」的轻量检查（十几秒，不构建），
 #     只有检测到变更才会真正跑构建。跨仓库没有原生 webhook，检查本身只能靠轮询。
 #  2) push：你改了 module/ 或本文件时重建。
-#  3) workflow_dispatch：手动指定上游 tag / 强制重建。
+#  3) workflow_dispatch：手动指定上游 tag / 强制重建（不想等轮询就用这个）。
 on:
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '*/15 * * * *'
   push:
     branches: [main]
     paths:
@@ -171,8 +171,8 @@ jobs:
           {
             echo "storeFile=keystore/module.jks"
             echo "keyAlias=installerx"
-            echo "keyPassword=installerx2026"
-            echo "storePassword=installerx2026"
+            echo "keyPassword=123456"
+            echo "storePassword=123456"
           } > src/keystore.properties
 
       - name: Pin versionCode
