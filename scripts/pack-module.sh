@@ -106,10 +106,11 @@ done
 render "$MOD/module.prop.in" > "$MOD/module.prop"
 rm -f "$MOD/module.prop.in"
 
-# 兜底：模板里若还有未替换的占位符，直接失败，不要发出坏包
-if grep -rqE '@[A-Z_]+@' "$MOD"; then
+# 兜底：模板里若还有未替换的占位符，直接失败，不要发出坏包。
+# 必须加 -I，否则会把 APK 二进制里偶然出现的 "@ABC@" 字节序列当成占位符误判。
+if grep -rIqE '@[A-Z_]+@' "$MOD"; then
   echo "unresolved placeholder in module tree:" >&2
-  grep -rnE '@[A-Z_]+@' "$MOD" >&2
+  grep -rInE '@[A-Z_]+@' "$MOD" >&2
   exit 1
 fi
 
