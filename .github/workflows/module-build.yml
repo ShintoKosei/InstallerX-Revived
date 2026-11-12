@@ -1,0 +1,320 @@
+name: Build system module
+
+# 触发方式
+#  1) schedule：每 6 小时做一次「上游有没有新版本」的轻量检查（几秒钟），
+#     只有检测到变更才会真正跑构建。跨仓库没有原生 webhook，检查本身只能靠轮询。
+#  2) push：你改了 module/ 或本文件时重建。
+#  3) workflow_dispatch：手动指定上游 tag / 强制重建。
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'module/**'
+      - 'scripts/pack-module.sh'
+      - '.github/workflows/module-build.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '上游 tag（留空 = 自动取上游最新 release）'
+        required: false
+        default: ''
+      force:
+        description: '强制重建（即使这个版本已经构建过）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: module-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: wxxsfxyzm/InstallerX-Revived
+  # 叠加在上游 versionCode（= git commit 数）之上。厂商自带的安装器 versionCode 很大
+  # （ColorOS 17 是 17000001），同一包名存在于多个分区时 PackageManager 取 versionCode 大的那个，
+  # 所以模块里的这份必须更大，否则会被原厂包压住而不生效。
+  VERSION_CODE_OFFSET: 1000000000
+  # 固定用一个滚动 release，每次构建替换里面的内容
+  RELEASE_TAG: module-latest
+
+jobs:
+  detect:
+    name: Detect upstream
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      flavor: ${{ steps.r.outputs.flavor }}
+      code: ${{ steps.r.outputs.code }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream release and decide whether to build
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_FORCE: ${{ inputs.force }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # 手动指定 tag，否则取上游最新的非 draft release（stable / preview 都算）
+          if [ -n "${INPUT_REF:-}" ]; then
+            TAG="$INPUT_REF"
+          else
+            TAG=$(gh api "repos/$UPSTREAM/releases?per_page=30" \
+              --jq '[.[] | select(.draft | not)] | sort_by(.created_at) | last | .tag_name')
+          fi
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "no upstream release found"; exit 1; }
+
+          # 稳定版 tag 是纯数字（26.09 / 26.05.01），预览版带 commit hash
+          if echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            FLAVOR=Stable
+          else
+            FLAVOR=Preview
+          fi
+
+          LAST_TAG=""
+          LAST_CODE=0
+          if [ -f module-state.json ]; then
+            LAST_TAG=$(jq -r '.upstreamTag // ""' module-state.json)
+            LAST_CODE=$(jq -r '.versionCode // 0' module-state.json)
+          fi
+
+          # 上游 versionCode 就是 git commit 数，只会随 main 前进而增长。
+          # blobless 克隆只取提交历史，几百 KB，用来数一下 tag 上有多少提交。
+          rm -rf /tmp/upstream-probe
+          git clone --filter=blob:none --no-checkout --single-branch --branch "$TAG" \
+            "https://github.com/$UPSTREAM.git" /tmp/upstream-probe >/dev/null 2>&1
+          UP_CODE=$(git -C /tmp/upstream-probe rev-list --count HEAD)
+          CODE=$(( VERSION_CODE_OFFSET + UP_CODE ))
+          [ "$CODE" -gt "$LAST_CODE" ] || CODE=$(( LAST_CODE + 1 ))
+          echo "上游 tag 提交数 $UP_CODE -> versionCode $CODE (上次 $LAST_CODE)"
+
+          BUILD=true
+          if [ "${EVENT:-}" != "push" ] && [ "${INPUT_FORCE:-false}" != "true" ] && [ "$TAG" = "$LAST_TAG" ]; then
+            echo "上游 $TAG 已经构建过，跳过"
+            BUILD=false
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "flavor=$FLAVOR" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "上游 $TAG ($FLAVOR) build=$BUILD (上次: ${LAST_TAG:-none} code=$LAST_CODE)"
+
+      - name: Sync fork with upstream
+        if: steps.r.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 只是保持 fork 跟上游一致；构建本身直接检出于上游 tag，所以这里失败不影响出包
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null || true
+          if git fetch --no-tags upstream main && git merge --no-edit FETCH_HEAD; then
+            git push origin HEAD:main || echo "push 失败，忽略"
+          else
+            git merge --abort 2>/dev/null || true
+            echo "合并上游失败，忽略（构建仍基于上游 tag 进行）"
+          fi
+
+  build:
+    name: Build ${{ matrix.variant }}
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [aosp, google, samsung]
+    steps:
+      - name: Checkout module repo
+        uses: actions/checkout@v7
+
+      - name: Checkout upstream at ${{ needs.detect.outputs.tag }}
+        uses: actions/checkout@v7
+        with:
+          repository: wxxsfxyzm/InstallerX-Revived
+          ref: ${{ needs.detect.outputs.tag }}
+          path: src
+          fetch-depth: 0
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          # 项目在 gradle/gradle-daemon-jvm.properties 里把 daemon JVM 固定为
+          # Microsoft OpenJDK 25，装成一致的发行版可以省掉一次 foojay 下载
+          distribution: 'microsoft'
+          java-version: '25'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          build-scan-publish: false
+          cache-read-only: false
+
+      - name: Restore signing key
+        run: |
+          set -euo pipefail
+          [ -f module-signing/module.jks.b64 ] || { echo "缺少 module-signing/module.jks.b64"; exit 1; }
+          mkdir -p src/keystore
+          base64 -d module-signing/module.jks.b64 > src/keystore/module.jks
+          {
+            echo "storeFile=keystore/module.jks"
+            echo "keyAlias=installerx"
+            echo "keyPassword=installerx2026"
+            echo "storePassword=installerx2026"
+          } > src/keystore.properties
+
+      - name: Pin versionCode
+        env:
+          CODE: ${{ needs.detect.outputs.code }}
+        run: |
+          set -euo pipefail
+          F=src/app/build.gradle.kts
+          grep -q 'versionCode = project.getGitCommitCount()' "$F" || {
+            echo "上游改动了 versionCode 写法，需要更新本 workflow"; exit 1; }
+          sed -i "s/versionCode = project.getGitCommitCount()/versionCode = ${CODE}/" "$F"
+          grep -n 'versionCode = ' "$F"
+
+      - name: Build APK
+        id: apk
+        working-directory: src
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          FLAVOR: ${{ needs.detect.outputs.flavor }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          case "$VARIANT" in
+            aosp)    PKG=com.android.packageinstaller ;;
+            google)  PKG=com.google.android.packageinstaller ;;
+            samsung) PKG=com.samsung.android.packageinstaller ;;
+            *) echo "unknown variant $VARIANT"; exit 1 ;;
+          esac
+          chmod +x ./gradlew
+          ./gradlew "assemble${FLAVOR}Release" -PAPP_ID="$PKG" -PVERSION_NAME="$TAG"
+          APK=$(find app/build/outputs/apk -path '*/release/*.apk' -type f | head -n 1)
+          [ -n "$APK" ] || { ls -R app/build/outputs/apk; exit 1; }
+          echo "path=$PWD/$APK" >> "$GITHUB_OUTPUT"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK
+        env:
+          CODE: ${{ needs.detect.outputs.code }}
+          APK: ${{ steps.apk.outputs.path }}
+          PKG: ${{ steps.apk.outputs.pkg }}
+        run: |
+          set -euo pipefail
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          BADGING=$("$BT/aapt2" dump badging "$APK" | head -n 1)
+          echo "$BADGING"
+          echo "$BADGING" | grep -q "name='$PKG'" || { echo "包名不对"; exit 1; }
+          echo "$BADGING" | grep -q "versionCode='$CODE'" || { echo "versionCode 不对"; exit 1; }
+          "$BT/apksigner" verify --print-certs "$APK" | head -n 4
+
+      - name: Pack module
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          CODE: ${{ needs.detect.outputs.code }}
+          VARIANT: ${{ matrix.variant }}
+          APK: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+          bash scripts/pack-module.sh "$VARIANT" "$APK" "$TAG" "$CODE" build
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: module-${{ matrix.variant }}
+          path: build/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish rolling release
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all module zips
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          CODE: ${{ needs.detect.outputs.code }}
+          FLAVOR: ${{ needs.detect.outputs.flavor }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+
+          UPURL="https://github.com/$UPSTREAM/releases/tag/$TAG"
+          {
+            echo "上游 [$TAG]($UPURL) 的系统安装器模块（$FLAVOR 构建），versionCode \`$CODE\`。"
+            echo
+            echo "| 变体 | 包名 | 适用 |"
+            echo "| --- | --- | --- |"
+            echo "| AOSP | \`com.android.packageinstaller\` | 国行小米/HyperOS（开启“使用原生安装器”）、ColorOS/OriginOS |"
+            echo "| Google | \`com.google.android.packageinstaller\` | 海外 ROM、Pixel、GMS 完整机型 |"
+            echo "| Samsung | \`com.samsung.android.packageinstaller\` | 三星（\`/system/priv-app/PackageInstaller_CHN\`） |"
+            echo
+            echo "刷入前务必确认设备上系统安装器的包名，刷错可能无法开机。刷入后重启生效。"
+            echo
+            echo "---"
+            echo
+            echo "### 上游更新说明"
+            echo
+            gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.body // "(上游 release 没有写说明)"' 2>/dev/null || echo "(无法获取上游说明)"
+          } > notes.md
+
+          # 滚动 release：删掉旧的整体重建，内容每次被替换
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$RELEASE_TAG" --target main \
+            --title "InstallerX Revived 系统模块（$TAG）" \
+            --notes-file notes.md \
+            dist/*.zip
+
+          # 每个变体一份 update.json，root 管理器可以直接一键更新
+          for v in aosp google samsung; do
+            case "$v" in
+              aosp)    LABEL=AOSP ;;
+              google)  LABEL=Google ;;
+              samsung) LABEL=Samsung ;;
+            esac
+            ZIPNAME="InstallerX-Revived-$LABEL-$TAG.zip"
+            jq -n --arg v "$TAG" --argjson c "$CODE" \
+              --arg z "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ZIPNAME" \
+              --arg l "https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" \
+              '{version: $v, versionCode: $c, zipUrl: $z, changelog: $l}' > "update-$v.json"
+          done
+
+          jq -n --arg t "$TAG" --argjson c "$CODE" --arg f "$FLAVOR" \
+            '{upstreamTag: $t, versionCode: $c, flavor: $f, builtAt: (now | todate)}' > module-state.json
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add module-state.json update-aosp.json update-google.json update-samsung.json
+          if git diff --cached --quiet; then
+            echo "状态无变化"
+          else
+            git commit -m "Update module to upstream $TAG ($CODE) [skip ci]"
+            git pull --rebase --autostash || true
+            git push
+          fi

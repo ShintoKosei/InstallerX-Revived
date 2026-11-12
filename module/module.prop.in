@@ -1,0 +1,7 @@
+id=@PKG@
+name=InstallerX Revived (@LABEL@)
+version=@TAG@
+versionCode=@CODE@
+author=wxxsfxyzm (app), @OWNER@ (module)
+description=InstallerX Revived 作为系统安装器（@LABEL@ 布局），跟随上游 @UPSTREAM@ 自动构建。
+updateJson=https://raw.githubusercontent.com/@REPO@/main/update-@VARIANT@.json
